@@ -1,0 +1,293 @@
+// PDF documents for Cromo, with PDFium, the engine of Chrome: a 'Document' gives the
+// number of its pages, their size, their text, and each page as a picture, to show in
+// a window or to save. The library of PDFium comes with the package, for Windows and
+// for Linux on x86-64: cromo downloads it by the lines native of cromo.mod, and puts
+// it next to the executable.
+//
+// '''
+// import pdfium
+//
+// pdfium.Document report = pdfium.load("report.pdf")
+// println("{} pages, the first says: {}", report.pageCount(), report.text(0))
+// pdfium.Picture page = report.render(0, 1200)   // 1200 pixels wide
+// fs.writeBytes("page1.bmp", page.bmp())
+// '''
+//
+// PDFium works on one thread at a time: a program that reads documents from more
+// threads takes turns, as with a thread.Mutex.
+
+// The C API of PDFium (fpdfview.h, fpdf_text.h, fpdf_doc.h). Its 'unsigned long' is
+// of 32 bits on Windows and of 64 on Linux: it is declared as u64, which is right
+// for the arguments on both, and of a result only the low 32 bits are read.
+import std.fs
+import unsafe
+
+extern "pdfium" {
+    void FPDF_InitLibrary()
+    u64 FPDF_GetLastError()
+    addr FPDF_LoadMemDocument64(addr data, i64 size, addr password)
+    void FPDF_CloseDocument(addr document)
+    i32 FPDF_GetPageCount(addr document)
+    addr FPDF_LoadPage(addr document, i32 index)
+    void FPDF_ClosePage(addr page)
+    f32 FPDF_GetPageWidthF(addr page)
+    f32 FPDF_GetPageHeightF(addr page)
+    addr FPDFBitmap_Create(i32 width, i32 height, i32 alpha)
+    i32 FPDFBitmap_FillRect(addr bitmap, i32 left, i32 top, i32 width, i32 height, u64 color)
+    addr FPDFBitmap_GetBuffer(addr bitmap)
+    i32 FPDFBitmap_GetStride(addr bitmap)
+    void FPDFBitmap_Destroy(addr bitmap)
+    void FPDF_RenderPageBitmap(addr bitmap, addr page, i32 x, i32 y, i32 width, i32 height, i32 rotate, i32 flags)
+    addr FPDFText_LoadPage(addr page)
+    void FPDFText_ClosePage(addr text)
+    i32 FPDFText_CountChars(addr text)
+    i32 FPDFText_GetText(addr text, i32 start, i32 count, addr result)
+    u64 FPDF_GetMetaText(addr document, addr tag, addr buffer, u64 size)
+}
+
+// A page drawn: 'width' by 'height' pixels, row after row from the top, each of four
+// bytes, red, green, blue and 255.
+public struct Picture {
+    public i32 width
+    public i32 height
+    public list<u8> pixels
+
+    // The picture as a BMP file, which gui.Image and gui.ImageBox read, and every
+    // program of images opens.
+    public list<u8> bmp() const {
+        i64 size = i64(width) * i64(height) * 4
+        list<u8> file
+        file.reserve(54 + size)
+        file.add('B')
+        file.add('M')
+        number(ref file, 54 + size, 4)
+        number(ref file, 0, 4)
+        number(ref file, 54, 4)  // where the pixels start
+        number(ref file, 40, 4)  // the size of this header
+        number(ref file, i64(width), 4)
+        number(ref file, i64(height), 4)
+        number(ref file, 1, 2)
+        number(ref file, 32, 2)  // the bits of a pixel
+        number(ref file, 0, 4)
+        number(ref file, size, 4)
+        number(ref file, 2835, 4)  // 72 pixels an inch
+        number(ref file, 2835, 4)
+        number(ref file, 0, 4)
+        number(ref file, 0, 4)
+        for (i32 y = height - 1; y >= 0; y--) {  // from the last row, each pixel blue, green, red
+            i64 row = i64(y) * i64(width) * 4
+            for (i32 x = 0; x < width; x++) {
+                i64 at = row + i64(x) * 4
+                file.add(pixels[at + 2])
+                file.add(pixels[at + 1])
+                file.add(pixels[at])
+                file.add(255)
+            }
+        }
+        ret file
+    }
+}
+
+// A number in the bytes of a file, the lowest first.
+void number(ref list<u8> file, i64 value, i64 bytes) {
+    i64 left = value
+    for (i64 i = 0; i < bytes; i++) {
+        file.add(u8(left % 256))
+        left = left / 256
+    }
+}
+
+// The text of 'count' units of UTF-16 at an address, as UTF-8.
+string fromUtf16(addr data, i64 count) {
+    list<u8> made
+    for (i64 i = 0; i < count; i++) {
+        u32 code = u32(take<u16>(offset(data, i * 2)))
+        if (code == 0) {
+            break
+        }
+        if (code >= 0xD800 && code < 0xDC00 && i + 1 < count) {  // the two halves of a character beyond U+FFFF
+            u32 low = u32(take<u16>(offset(data, (i + 1) * 2)))
+            if (low >= 0xDC00 && low < 0xE000) {
+                code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                i++
+            }
+        }
+        if (code < 0x80) {
+            made.add(u8(code))
+        } else if (code < 0x800) {
+            made.add(u8(0xC0 | (code >> 6)))
+            made.add(u8(0x80 | (code & 0x3F)))
+        } else if (code < 0x10000) {
+            made.add(u8(0xE0 | (code >> 12)))
+            made.add(u8(0x80 | ((code >> 6) & 0x3F)))
+            made.add(u8(0x80 | (code & 0x3F)))
+        } else {
+            made.add(u8(0xF0 | (code >> 18)))
+            made.add(u8(0x80 | ((code >> 12) & 0x3F)))
+            made.add(u8(0x80 | ((code >> 6) & 0x3F)))
+            made.add(u8(0x80 | (code & 0x3F)))
+        }
+    }
+    ret string(made)
+}
+
+// A PDF document, open. It is not copied, only moved, and is closed when it ends.
+public struct Document {
+    addr handle
+    addr bytes  // of its file, which PDFium reads for as long as the document is open
+
+    // Opens a document from the bytes of a PDF file, as 'embed' and 'fs.readBytes' give
+    // them. Throws an 'Error' when they are not a PDF, when the file is damaged, and
+    // when it asks for a password.
+    public Document(list<u8> file) {
+        FPDF_InitLibrary()  // once for the program: the next calls do nothing
+        bytes = alloc(file.len() > 0 ? file.len() : 1)
+        for (i64 i = 0; i < file.len(); i++) {
+            put<u8>(offset(bytes, i), file[i])
+        }
+        addr none
+        handle = FPDF_LoadMemDocument64(bytes, file.len(), none)
+        if (handle == none) {
+            u64 code = FPDF_GetLastError() & 0xFFFFFFFF
+            free(bytes)
+            bytes = none
+            string why = "it cannot be read"
+            if (code == 3) {
+                why = "it is not a PDF, or it is damaged"
+            } else if (code == 4) {
+                why = "it asks for a password"
+            } else if (code == 5) {
+                why = "it is protected in a way that is not supported"
+            }
+            throw Error(format("cannot open the document: {}", why))
+        }
+    }
+
+    ~Document() {
+        addr none
+        if (handle != none) {
+            FPDF_CloseDocument(handle)
+        }
+        if (bytes != none) {
+            free(bytes)
+        }
+    }
+
+    // The number of pages.
+    public i64 pageCount() const {
+        ret i64(FPDF_GetPageCount(handle))
+    }
+
+    // A page, open; a page that the document does not have is a panic.
+    addr page(i64 index) const {
+        i64 count = pageCount()
+        if (index < 0 || index >= count) {
+            panic(format("the document has {} pages, from 0: there is no page {}", count, index))
+        }
+        addr found = FPDF_LoadPage(handle, i32(index))
+        addr none
+        if (found == none) {
+            throw Error(format("cannot read the page {} of the document", index))
+        }
+        ret found
+    }
+
+    // The width of a page, from 0, in points: 72 of them are an inch, and an A4 page is
+    // 595 by 842.
+    public f32 pageWidth(i64 index) const {
+        addr p = page(index)
+        f32 width = FPDF_GetPageWidthF(p)
+        FPDF_ClosePage(p)
+        ret width
+    }
+
+    // The height of a page, in points.
+    public f32 pageHeight(i64 index) const {
+        addr p = page(index)
+        f32 height = FPDF_GetPageHeightF(p)
+        FPDF_ClosePage(p)
+        ret height
+    }
+
+    // The text of a page, in the order in which the document has it, with its ends of
+    // line; "" for a page of images only, as a scan.
+    public string text(i64 index) const {
+        addr p = page(index)
+        addr reader = FPDFText_LoadPage(p)
+        addr none
+        string made
+        if (reader != none) {
+            i32 count = FPDFText_CountChars(reader)
+            if (count > 0) {
+                addr units = alloc((i64(count) + 1) * 2)
+                i32 written = FPDFText_GetText(reader, 0, count, units)
+                made = fromUtf16(units, i64(written))
+                free(units)
+            }
+            FPDFText_ClosePage(reader)
+        }
+        FPDF_ClosePage(p)
+        ret made
+    }
+
+    // A page drawn 'width' pixels wide, on white, as high as its shape asks. A width
+    // below 1 or above 16384 is a panic.
+    public Picture render(i64 index, i32 width) const {
+        if (width < 1 || width > 16384) {
+            panic(format("the width of a page drawn is from 1 to 16384 pixels, found {}", width))
+        }
+        addr p = page(index)
+        Picture made
+        f32 across = FPDF_GetPageWidthF(p)
+        f32 down = FPDF_GetPageHeightF(p)
+        i32 height = across > 0 ? i32(f32(width) * down / across + 0.5) : 0
+        if (height < 1) {
+            height = 1
+        }
+        addr none
+        addr bitmap = FPDFBitmap_Create(width, height, 0)
+        if (bitmap == none) {
+            FPDF_ClosePage(p)
+            throw Error(format("no memory for a page of {} by {} pixels", width, height))
+        }
+        FPDFBitmap_FillRect(bitmap, 0, 0, width, height, 0xFFFFFFFF)
+        FPDF_RenderPageBitmap(bitmap, p, 0, 0, width, height, 0, 0x11)  // the annotations too, and red first in each pixel
+        addr buffer = FPDFBitmap_GetBuffer(bitmap)
+        i64 stride = i64(FPDFBitmap_GetStride(bitmap))
+        made.width = width
+        made.height = height
+        made.pixels.reserve(i64(width) * i64(height) * 4)
+        for (i64 y = 0; y < i64(height); y++) {
+            addr row = offset(buffer, y * stride)
+            for (i64 x = 0; x < i64(width); x++) {
+                made.pixels.add(take<u8>(offset(row, x * 4)))
+                made.pixels.add(take<u8>(offset(row, x * 4 + 1)))
+                made.pixels.add(take<u8>(offset(row, x * 4 + 2)))
+                made.pixels.add(255)
+            }
+        }
+        FPDFBitmap_Destroy(bitmap)
+        FPDF_ClosePage(p)
+        ret made
+    }
+
+    // What the document says of itself under a name, as "Title", "Author", "Subject",
+    // "Keywords", "Creator" and "Producer"; "" when it does not say.
+    public string info(string name) const {
+        addr none
+        u64 size = FPDF_GetMetaText(handle, name.cstring(), none, 0) & 0xFFFFFFFF  // in bytes, with the zero at its end
+        if (size <= 2) {
+            ret ""
+        }
+        addr units = alloc(i64(size))
+        FPDF_GetMetaText(handle, name.cstring(), units, size)
+        string made = fromUtf16(units, i64(size) / 2)
+        free(units)
+        ret made
+    }
+}
+
+// Opens a PDF file. Throws an 'Error' when the file cannot be read or is not a PDF.
+public Document load(string path) {
+    ret Document(fs.readBytes(path))
+}

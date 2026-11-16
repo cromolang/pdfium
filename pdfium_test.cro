@@ -1,0 +1,88 @@
+// The tests of the package: cromo test pdfium.cro, in this folder. The document of
+// testdata has two pages, written by tools/sample.py: the first of 300 by 200 points,
+// with a line of text and a red square at its bottom left, the second of 200 by 300.
+
+Document sample() {
+    ret Document(embed("testdata/sample.pdf"))
+}
+
+// The color of a pixel of a picture, as 0xRRGGBB.
+u32 pixel(Picture picture, i32 x, i32 y) {
+    i64 at = (i64(y) * i64(picture.width) + i64(x)) * 4
+    ret (u32(picture.pixels[at]) << 16) | (u32(picture.pixels[at + 1]) << 8) | u32(picture.pixels[at + 2])
+}
+
+[[test]]
+void thePages() {
+    Document d = sample()
+    assert(d.pageCount() == 2)
+    assert(d.pageWidth(0) == 300 && d.pageHeight(0) == 200)
+    assert(d.pageWidth(1) == 200 && d.pageHeight(1) == 300)
+}
+
+[[test]]
+void theText() {
+    Document d = sample()
+    assert(d.text(0).trim() == "Hello from Cromo")
+    assert(d.text(1).trim() == "The second page")
+}
+
+[[test]]
+void theInformation() {
+    Document d = sample()
+    assert(d.info("Title") == "A sample for the tests")
+    assert(d.info("Author") == "Cromo")
+    assert(d.info("Subject") == "")
+}
+
+[[test]]
+void aPageDrawn() {
+    Document d = sample()
+    Picture p = d.render(0, 600)  // twice its points
+    assert(p.width == 600 && p.height == 400)
+    assert(p.pixels.len() == 600 * 400 * 4)
+    assert(pixel(p, 590, 10) == 0xFFFFFF)   // white, far from everything
+    assert(pixel(p, 100, 300) == 0xFF0000)  // the square: 20 to 80 points from the left, 20 to 80 from the bottom
+    assert(pixel(p, 300, 300) == 0xFFFFFF)
+    i64 dark = 0  // the text is somewhere in its band: 150 points from the bottom
+    for (i32 y = 60; y < 110; y++) {
+        for (i32 x = 40; x < 460; x++) {
+            if (pixel(p, x, y) == 0x000000) {
+                dark++
+            }
+        }
+    }
+    assert(dark > 500)
+    Picture tall = d.render(1, 100)
+    assert(tall.width == 100 && tall.height == 150)
+}
+
+[[test]]
+void asABmp() {
+    Document d = sample()
+    Picture p = d.render(0, 30)
+    list<u8> file = p.bmp()
+    assert(file.len() == 54 + 30 * 20 * 4)
+    assert(file[0] == 'B' && file[1] == 'M')
+    assert(file[18] == 30 && file[22] == 20 && file[28] == 32)
+}
+
+[[test]]
+void notAPdf() {
+    bool refused = false
+    try {
+        Document d = Document("this is a text, not a PDF".bytes())
+    } catch (Error e) {
+        refused = e.message() == "cannot open the document: it is not a PDF, or it is damaged"
+    }
+    assert(refused)
+}
+
+[[test]]
+void manyTimes() {
+    for (i64 i = 0; i < 50; i++) {
+        Document d = sample()
+        assert(d.text(i % 2).len() > 0)
+        assert(d.render(i % 2, 64).width == 64)
+    }
+}
